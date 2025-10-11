@@ -1,0 +1,38 @@
+# --- Core API dependencies ---
+fastapi==0.117.1
+uvicorn[standard]==0.30.6
+httpx[http2]==0.27.0
+anyio==4.4.0
+pydantic==2.11.1
+pydantic-settings==2.4.0
+starlette==0.48.0
+
+# --- Playwright for JS rendering ---
+playwright==1.47.0
+
+# --- HTML parsing & data extraction ---
+beautifulsoup4==4.12.3
+selectolax==0.3.21
+tldextract==5.1.2
+
+# --- Structured data handling ---
+jsonschema==4.23.0
+pyld==2.0.4
+rdflib==7.1.1
+microdata==0.8.1
+
+# --- Data & caching ---
+pandas==2.2.3
+pyarrow==17.0.0
+aioredis==2.0.1
+tenacity==9.0.0
+
+# --- Optional: screenshots & storage ---
+boto3==1.35.20
+
+# --- Streamlit dashboard ---
+streamlit==1.39.0
+
+# --- Utilities ---
+typing-extensions==4.12.2
+idna==3.10
