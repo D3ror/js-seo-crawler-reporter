@@ -4,19 +4,35 @@ from typing import List, Optional
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 
-from api.crawl import CrawlerService, crawl_urls_immediate
+from api.crawl import (
+    CrawlerService,
+    crawl_urls_immediate,
+    crawl_domain_immediate,
+)
 
 app = FastAPI(title="JS SEO Crawler API")
 crawler: Optional[CrawlerService] = None
 
 
 class CrawlRequest(BaseModel):
-    """Request body for /crawl, matching what the Streamlit UI sends."""
+    """
+    Request body for /crawl, matching what the Streamlit UI sends.
+
+    mode:
+      - "list"   → treat `urls` as an explicit list to crawl
+      - "domain" → treat `urls[0]` as seed URL and crawl internal links
+    """
     urls: List[str]
-    depth: int = 1
-    concurrency: int = 3
-    delay: float = 0.5
-    headless: bool = True
+    mode: str = "list"          # "list" or "domain"
+    max_pages: int = 50         # used in domain mode
+    max_depth: int = 2          # used in domain mode
+
+    depth: int = 1              # reserved for future use
+    concurrency: int = 3        # reserved for future use
+    delay: float = 0.5          # reserved for future use
+    headless: bool = True       # reserved for future use
+
+    emulate_googlebot: bool = False  # if True, use Googlebot UA
 
 
 @app.on_event("startup")
@@ -41,8 +57,12 @@ async def health():
 async def crawl_url(request: CrawlRequest):
     """
     Immediate crawl endpoint (no job queue):
-    - Accepts a list of URLs
-    - Returns pages + structured_data + links in one response
+
+    - In `mode="list"`:
+        Accepts a list of URLs and returns pages + structured_data + links.
+    - In `mode="domain"`:
+        Uses the first URL as seed and crawls internal links up to
+        `max_pages` and `max_depth`.
     """
     if not crawler:
         raise HTTPException(status_code=500, detail="Crawler not initialized")
@@ -50,9 +70,32 @@ async def crawl_url(request: CrawlRequest):
     if not request.urls:
         raise HTTPException(status_code=400, detail="No URLs provided")
 
+    options = {
+        "emulate_googlebot": request.emulate_googlebot,
+        # you can add more per-request options here later if needed
+    }
+
     try:
-        result = await crawl_urls_immediate(crawler, request.urls)
+        if request.mode == "domain":
+            # Use first URL as seed
+            start_url = request.urls[0]
+            result = await crawl_domain_immediate(
+                crawler,
+                start_url=start_url,
+                max_pages=request.max_pages,
+                max_depth=request.max_depth,
+                options=options,
+            )
+        else:
+            # Default: treat urls as explicit list
+            result = await crawl_urls_immediate(
+                crawler,
+                request.urls,
+                options=options,
+            )
+
         return result
+
     except Exception as e:
         # Log to stdout so you can see it in `fly logs`
         print("Error in /crawl:", repr(e))
