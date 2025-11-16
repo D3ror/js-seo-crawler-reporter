@@ -166,8 +166,8 @@ class CrawlerService:
     async def _render(
         self,
         url: str,
-        wait_until: str = "networkidle",
-        timeout: int = 20000,
+        wait_until: str = "domcontentloaded",
+        timeout: int = 15000,
         user_agent: Optional[str] = None,
     ):
         ctx_kwargs: Dict[str, Any] = {
@@ -204,92 +204,127 @@ class CrawlerService:
         if options.get("emulate_googlebot"):
             ua = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
 
-        # robots.txt checks are TODO; we just fetch page for now
-        status, raw_html, headers = await self._fetch_raw(norm, user_agent=ua)
-        rendered_html, screenshot = await self._render(norm, user_agent=ua)
+        try:
+            # robots.txt checks are TODO; we just fetch page for now
+            status, raw_html, headers = await self._fetch_raw(norm, user_agent=ua)
 
-        # --- Text diff between raw & rendered ---
-        diff_score = compute_diff_score(raw_html, rendered_html)
+            # Bound the render time per page
+            rendered_html, screenshot = await asyncio.wait_for(
+                self._render(norm, user_agent=ua),
+                timeout=20,
+            )
 
-        # --- Parse rendered DOM ---
-        soup = BeautifulSoup(rendered_html, "lxml")
+            # --- Text diff between raw & rendered ---
+            diff_score = compute_diff_score(raw_html, rendered_html)
 
-        # Title
-        title_tag = soup.title.string.strip() if soup.title and soup.title.string else None
+            # --- Parse rendered DOM ---
+            soup = BeautifulSoup(rendered_html, "lxml")
 
-        # Meta description
-        meta_desc = None
-        md = soup.find("meta", attrs={"name": "description"})
-        if md and md.get("content"):
-            meta_desc = md["content"].strip()
+            # Title
+            title_tag = (
+                soup.title.string.strip()
+                if soup.title and soup.title.string
+                else None
+            )
 
-        # Canonical
-        canonical_tag = None
-        canon = soup.find("link", rel=lambda v: v and "canonical" in v.lower())
-        if canon and canon.get("href"):
-            canonical_tag = canon["href"].strip()
+            # Meta description
+            meta_desc = None
+            md = soup.find("meta", attrs={"name": "description"})
+            if md and md.get("content"):
+                meta_desc = md["content"].strip()
 
-        # Meta robots
-        meta_robots = None
-        mr = soup.find("meta", attrs={"name": "robots"})
-        if mr and mr.get("content"):
-            meta_robots = mr["content"].strip().lower()
+            # Canonical
+            canonical_tag = None
+            canon = soup.find("link", rel=lambda v: v and "canonical" in v.lower())
+            if canon and canon.get("href"):
+                canonical_tag = canon["href"].strip()
 
-        # X-Robots-Tag (from headers)
-        x_robots = headers.get("x-robots-tag") or headers.get("X-Robots-Tag")
+            # Meta robots
+            meta_robots = None
+            mr = soup.find("meta", attrs={"name": "robots"})
+            if mr and mr.get("content"):
+                meta_robots = mr["content"].strip().lower()
 
-        # Hreflang
-        hreflangs: List[Dict[str, str]] = []
-        for link in soup.find_all("link", rel=lambda v: v and "alternate" in v.lower()):
-            lang = link.get("hreflang")
-            href = link.get("href")
-            if lang and href:
-                hreflangs.append({"lang": lang, "href": href})
+            # X-Robots-Tag (from headers)
+            x_robots = headers.get("x-robots-tag") or headers.get("X-Robots-Tag")
 
-        # Links
-        internal_links: Set[str] = set()
-        external_links: Set[str] = set()
-        for a in soup.find_all("a", href=True):
-            href = a["href"].strip()
-            abs_url = urljoin(norm, href)
-            parsed_link = urlparse(abs_url)
-            if not parsed_link.scheme.startswith("http"):
-                continue
-            if (parsed_link.hostname or "").lower() == base_host.lower():
-                internal_links.add(normalize_url(abs_url))
-            else:
-                external_links.add(normalize_url(abs_url))
+            # Hreflang
+            hreflangs: List[Dict[str, str]] = []
+            for link in soup.find_all("link", rel=lambda v: v and "alternate" in v.lower()):
+                lang = link.get("hreflang")
+                href = link.get("href")
+                if lang and href:
+                    hreflangs.append({"lang": lang, "href": href})
 
-        # Structured data
-        jsonld = extract_jsonld(rendered_html)
-        schema_validations = validate_jsonld(jsonld)
+            # Links
+            internal_links: Set[str] = set()
+            external_links: Set[str] = set()
+            for a in soup.find_all("a", href=True):
+                href = a["href"].strip()
+                abs_url = urljoin(norm, href)
+                parsed_link = urlparse(abs_url)
+                if not parsed_link.scheme.startswith("http"):
+                    continue
+                if (parsed_link.hostname or "").lower() == base_host.lower():
+                    internal_links.add(normalize_url(abs_url))
+                else:
+                    external_links.add(normalize_url(abs_url))
 
-        # CWV (now page-level via PSI where possible)
-        psi = await self.get_cwv(norm)
+            # Structured data
+            jsonld = extract_jsonld(rendered_html)
+            schema_validations = validate_jsonld(jsonld)
 
-        # Indexability heuristic
-        indexable_flag = is_indexable(status, meta_robots, x_robots)
+            # Indexability heuristic
+            indexable_flag = is_indexable(status, meta_robots, x_robots)
 
-        # build detailed single-page result
-        return {
-            "url": norm,
-            "status": status,
-            "headers": dict(headers),
-            "diff_score": diff_score,
-            "jsonld": jsonld,
-            "schema_validations": schema_validations,
-            "psi": psi,
-            "screenshot": base64.b64encode(screenshot).decode("ascii"),
-            "title": title_tag,
-            "meta_description": meta_desc,
-            "canonical": canonical_tag or norm,
-            "meta_robots": meta_robots,
-            "x_robots": x_robots,
-            "hreflangs": hreflangs,
-            "internal_links": list(internal_links),
-            "external_links": list(external_links),
-            "indexable": indexable_flag,
-        }
+            # build detailed single-page result (without PSI, added later)
+            return {
+                "url": norm,
+                "status": status,
+                "headers": dict(headers),
+                "diff_score": diff_score,
+                "jsonld": jsonld,
+                "schema_validations": schema_validations,
+                "screenshot": base64.b64encode(screenshot).decode("ascii"),
+                "title": title_tag,
+                "meta_description": meta_desc,
+                "canonical": canonical_tag or norm,
+                "meta_robots": meta_robots,
+                "x_robots": x_robots,
+                "hreflangs": hreflangs,
+                "internal_links": list(internal_links),
+                "external_links": list(external_links),
+                "indexable": indexable_flag,
+            }
+
+        except httpx.TimeoutException as e:
+            return {
+                "url": norm,
+                "status": 0,
+                "error_type": "http_timeout",
+                "error_message": str(e),
+            }
+        except httpx.RequestError as e:
+            return {
+                "url": norm,
+                "status": 0,
+                "error_type": "http_error",
+                "error_message": str(e),
+            }
+        except asyncio.TimeoutError as e:
+            return {
+                "url": norm,
+                "status": 0,
+                "error_type": "render_timeout",
+                "error_message": str(e),
+            }
+        except Exception as e:
+            return {
+                "url": norm,
+                "status": 0,
+                "error_type": "crawler_internal_error",
+                "error_message": str(e),
+            }
 
 
 # -----------------------------------------
@@ -407,29 +442,41 @@ async def crawl_urls_immediate(
     for u in urls:
         single = await service._crawl_single(u, options)
 
-        psi = single.get("psi", {})
+        error_type = single.get("error_type")
+        psi: Dict[str, Any] = {}
+
+        # Only call PSI if the page crawl itself didn't fail
+        if not error_type and single.get("url"):
+            psi = await service.get_cwv(single["url"])
 
         pages.append(
             {
-                "url": single["url"],
-                "status": single["status"],
+                "url": single.get("url", u),
+                "status": single.get("status"),
                 "title": single.get("title"),
                 "meta_description": single.get("meta_description"),
                 "canonical": single.get("canonical"),
                 "robots": single.get("meta_robots") or single.get("x_robots"),
-                "hreflang": ", ".join([h["lang"] for h in single.get("hreflangs", [])]) or None,
+                "hreflang": ", ".join(
+                    [h["lang"] for h in single.get("hreflangs", [])]
+                )
+                or None,
                 "diff_score": single.get("diff_score"),
                 "indexable": single.get("indexable"),
+                "error_type": error_type,
+                "error_message": single.get("error_message"),
                 "lcp_ms": psi.get("lcp_ms"),
                 "cls": psi.get("cls"),
                 "inp_ms": psi.get("inp_ms"),
             }
         )
 
-        for block, validation in zip(single["jsonld"], single["schema_validations"]):
+        for block, validation in zip(
+            single.get("jsonld", []), single.get("schema_validations", [])
+        ):
             structured_data.append(
                 {
-                    "url": single["url"],
+                    "url": single.get("url", u),
                     "type": block.get("@type", "Unknown"),
                     "valid": validation.get("valid", True),
                     "missing_props": validation.get("missing_props", []),
@@ -463,6 +510,9 @@ async def crawl_domain_immediate(
     Crawl a domain starting from start_url, following internal links
     up to max_pages and max_depth (BFS), and return the same structure
     as crawl_urls_immediate.
+
+    To keep the demo fast and within PSI limits, CWV is only fetched
+    for the first few pages.
     """
     if options is None:
         options = {}
@@ -480,6 +530,9 @@ async def crawl_domain_immediate(
     all_internal_links: Set[str] = set()
     all_external_links: Set[str] = set()
 
+    # Only fetch CWV for first N pages in domain mode
+    MAX_PSI_PAGES = 5
+
     while not queue.empty() and len(visited) < max_pages:
         current_url, depth = await queue.get()
         if current_url in visited:
@@ -489,31 +542,43 @@ async def crawl_domain_immediate(
         try:
             single = await service._crawl_single(current_url, options)
         except Exception:
-            continue  # skip failures
+            # If _crawl_single itself exploded, skip this URL entirely
+            continue
 
-        psi = single.get("psi", {})
+        error_type = single.get("error_type")
+        psi: Dict[str, Any] = {}
+
+        if not error_type and len(pages) < MAX_PSI_PAGES:
+            psi = await service.get_cwv(single.get("url", current_url))
 
         pages.append(
             {
-                "url": single["url"],
-                "status": single["status"],
+                "url": single.get("url", current_url),
+                "status": single.get("status"),
                 "title": single.get("title"),
                 "meta_description": single.get("meta_description"),
                 "canonical": single.get("canonical"),
                 "robots": single.get("meta_robots") or single.get("x_robots"),
-                "hreflang": ", ".join([h["lang"] for h in single.get("hreflangs", [])]) or None,
+                "hreflang": ", ".join(
+                    [h["lang"] for h in single.get("hreflangs", [])]
+                )
+                or None,
                 "diff_score": single.get("diff_score"),
                 "indexable": single.get("indexable"),
+                "error_type": error_type,
+                "error_message": single.get("error_message"),
                 "lcp_ms": psi.get("lcp_ms"),
                 "cls": psi.get("cls"),
                 "inp_ms": psi.get("inp_ms"),
             }
         )
 
-        for block, validation in zip(single["jsonld"], single["schema_validations"]):
+        for block, validation in zip(
+            single.get("jsonld", []), single.get("schema_validations", [])
+        ):
             structured_data.append(
                 {
-                    "url": single["url"],
+                    "url": single.get("url", current_url),
                     "type": block.get("@type", "Unknown"),
                     "valid": validation.get("valid", True),
                     "missing_props": validation.get("missing_props", []),

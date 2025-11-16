@@ -70,27 +70,32 @@ async def crawl_url(request: CrawlRequest):
     if not request.urls:
         raise HTTPException(status_code=400, detail="No URLs provided")
 
+    # Hard safety caps for demo stability
+    urls = request.urls[:20]  # max 20 URLs even if client sends more
+    max_pages = max(1, min(request.max_pages, 50))
+    max_depth = max(1, min(request.max_depth, 3))
+
     options = {
         "emulate_googlebot": request.emulate_googlebot,
-        # you can add more per-request options here later if needed
+        "mode": request.mode,
     }
 
     try:
         if request.mode == "domain":
             # Use first URL as seed
-            start_url = request.urls[0]
+            start_url = urls[0]
             result = await crawl_domain_immediate(
                 crawler,
                 start_url=start_url,
-                max_pages=request.max_pages,
-                max_depth=request.max_depth,
+                max_pages=max_pages,
+                max_depth=max_depth,
                 options=options,
             )
         else:
             # Default: treat urls as explicit list
             result = await crawl_urls_immediate(
                 crawler,
-                request.urls,
+                urls,
                 options=options,
             )
 
@@ -106,7 +111,7 @@ async def crawl_url(request: CrawlRequest):
 async def get_cwv(url: str, strategy: str = "mobile"):
     """
     CWV endpoint used by the Streamlit UI.
-    Currently calls the stubbed CrawlerService.get_cwv.
+    Currently calls CrawlerService.get_cwv (PSI + fallback).
     """
     if not crawler:
         raise HTTPException(status_code=500, detail="Crawler not initialized")
@@ -116,9 +121,6 @@ async def get_cwv(url: str, strategy: str = "mobile"):
         print("Error in /cwv:", repr(e))
         raise HTTPException(status_code=500, detail=str(e))
 
-
-# The status/results endpoints are not used by the Streamlit app in Option A,
-# but you can keep or remove them depending on whether you want a job-based API later.
 
 @app.get("/status/{job_id}")
 async def get_status(job_id: str):

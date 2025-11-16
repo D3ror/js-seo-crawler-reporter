@@ -33,12 +33,12 @@ urls = st.sidebar.text_area(
     ),
 )
 
-# Domain crawl limits
+# Domain crawl limits (tightened for demo stability)
 max_pages = st.sidebar.slider(
-    "Max pages (domain crawl)", min_value=10, max_value=200, value=50, step=10
+    "Max pages (domain crawl)", min_value=5, max_value=50, value=20, step=5
 )
 max_depth = st.sidebar.slider(
-    "Max depth (domain crawl)", min_value=1, max_value=5, value=2
+    "Max depth (domain crawl)", min_value=1, max_value=3, value=2
 )
 
 # Reserved for future use, still sent to API
@@ -73,7 +73,10 @@ run_button = st.sidebar.button("🚀 Start Crawl")
 # HELPER FUNCTIONS
 # ==========================================
 def call_crawl_api(url_list):
-    """Send crawl request to FastAPI backend."""
+    """
+    Send crawl request to FastAPI backend.
+    Can be used for a single URL or a list (list mode or domain mode).
+    """
     mode = "domain" if crawl_mode == "Domain crawl" else "list"
 
     payload = {
@@ -99,6 +102,16 @@ def call_crawl_api(url_list):
                 "⚠️ **502!** This usually indicates that the machine was sleeping or restarting. "
                 "Please wait a few seconds and try running the crawl again."
             )
+        elif status and 500 <= status < 600:
+            st.error(
+                f"Crawler API error (server-side, {status}). "
+                "This is likely an internal error or resource limit on the crawler."
+            )
+        elif status and 400 <= status < 500:
+            st.error(
+                f"Crawler API error (client-side, {status}). "
+                "Please check the URLs and crawl settings."
+            )
         else:
             st.error(f"API HTTP error ({status}): {e}")
         return None
@@ -123,21 +136,62 @@ if run_button:
 
         if crawl_mode == "Domain crawl":
             # Only the first URL is used as seed
-            url_list = [url_list[0]]
+            seed_url = url_list[0]
+            with st.spinner(f"Domain crawl starting from {seed_url}..."):
+                crawl_data = call_crawl_api([seed_url])
 
-        with st.spinner(
-            f"{'Domain crawl' if crawl_mode == 'Domain crawl' else 'Crawling'} "
-            f"{len(url_list)} URL(s)..."
-        ):
-            crawl_data = call_crawl_api(url_list)
-
-        if crawl_data:
-            st.session_state["crawl_results"] = crawl_data
-            df = pd.DataFrame(crawl_data.get("pages", []))
-            st.session_state["df"] = df
-            st.success("✅ Crawl complete.")
+            if crawl_data:
+                st.session_state["crawl_results"] = crawl_data
+                df = pd.DataFrame(crawl_data.get("pages", []))
+                st.session_state["df"] = df
+                st.success("✅ Domain crawl complete.")
+            else:
+                st.error("Domain crawl failed or returned no data.")
         else:
-            st.error("Crawl failed or returned no data.")
+            # URL list mode: crawl each URL one by one with progress bar
+            if len(url_list) > 20:
+                st.warning(
+                    "For demo purposes, a maximum of 20 URLs is allowed per crawl. "
+                    "Only the first 20 URLs will be used."
+                )
+                url_list = url_list[:20]
+
+            total = len(url_list)
+            progress = st.progress(0)
+            status_placeholder = st.empty()
+
+            all_pages = []
+            all_structured = []
+            all_internal = set()
+            all_external = set()
+
+            for i, url in enumerate(url_list, start=1):
+                status_placeholder.info(f"Crawling {i}/{total}: {url}")
+                crawl_data = call_crawl_api([url])
+
+                if crawl_data:
+                    all_pages.extend(crawl_data.get("pages", []))
+                    all_structured.extend(crawl_data.get("structured_data", []))
+                    all_internal.update(crawl_data.get("links", {}).get("internal", []))
+                    all_external.update(crawl_data.get("links", {}).get("external", []))
+
+                progress.progress(i / total)
+
+            if all_pages:
+                crawl_results = {
+                    "pages": all_pages,
+                    "structured_data": all_structured,
+                    "links": {
+                        "internal": sorted(all_internal),
+                        "external": sorted(all_external),
+                    },
+                }
+                st.session_state["crawl_results"] = crawl_results
+                df = pd.DataFrame(all_pages)
+                st.session_state["df"] = df
+                status_placeholder.success("✅ URL list crawl complete.")
+            else:
+                status_placeholder.error("No data returned for any URL. Crawl failed.")
 
 # Ensure df is always created if crawl_results exists
 if "crawl_results" in st.session_state and "df" not in st.session_state:
@@ -190,9 +244,9 @@ with seo_tab:
             "status",
             "indexable",
             "canonical",
-            "meta_robots",
-            "x_robots",
+            "robots",
             "diff_score",
+            "error_type",
         ]
         cols = [c for c in main_cols if c in df.columns]
 
@@ -207,7 +261,7 @@ with seo_tab:
                     non_indexable[
                         [
                             c
-                            for c in ["url", "status", "meta_robots", "x_robots"]
+                            for c in ["url", "status", "robots", "error_type"]
                             if c in non_indexable.columns
                         ]
                     ],
@@ -217,6 +271,16 @@ with seo_tab:
                 st.info("All crawled pages appear indexable.")
         else:
             st.info("No indexability data available.")
+
+        st.subheader("Crawl errors by type")
+        if "error_type" in df.columns:
+            err_counts = df["error_type"].value_counts(dropna=True)
+            if not err_counts.empty:
+                st.table(err_counts.rename("count"))
+            else:
+                st.info("No crawl errors recorded.")
+        else:
+            st.info("No error information available.")
     else:
         st.info("Run a crawl to display SEO data.")
 
@@ -259,7 +323,9 @@ with sd_tab:
                 if not no_sd.empty:
                     st.dataframe(no_sd[["url"]], use_container_width=True)
                 else:
-                    st.info("All crawled pages have at least one structured data object.")
+                    st.info(
+                        "All crawled pages have at least one structured data object."
+                    )
         else:
             st.warning("No structured data detected on any crawled page.")
     else:
@@ -305,9 +371,8 @@ with cwv_tab:
         if all(col in df.columns for col in ["lcp_ms", "cls", "inp_ms"]):
             st.subheader("Per-URL CWV metrics")
             st.caption(
-                "ℹ️ CWV values are currently approximate and may be similar across pages "
-                "on the same domain. A future version will fetch true page-level field data "
-                "from the PageSpeed Insights / CrUX API."
+                "ℹ️ CWV values are fetched from the PageSpeed Insights API on a per-URL basis. "
+                "In domain crawls, only the first few pages receive CWV data to keep the demo fast."
             )
             st.dataframe(
                 df[["url", "lcp_ms", "cls", "inp_ms"]],
