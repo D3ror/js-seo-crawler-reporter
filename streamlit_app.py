@@ -44,13 +44,26 @@ max_depth = st.sidebar.slider(
 # Reserved for future use, still sent to API
 depth = st.sidebar.slider("Crawl depth (reserved)", 1, 5, 2)
 concurrency = st.sidebar.slider("Concurrent requests (reserved)", 1, 10, 3)
-delay = st.sidebar.number_input("Request delay (seconds, reserved)", 0.0, 5.0, 0.5, 0.1)
-headless = st.sidebar.checkbox("Run headless browser", value=True)
+delay = st.sidebar.number_input(
+    "Request delay (seconds, reserved)", 0.0, 5.0, 0.5, 0.1
+)
+
+headless = st.sidebar.checkbox(
+    "Run as headless browser",
+    value=True,
+    help=(
+        "Simulates how a real browser renders a page (including JavaScript). "
+        "Useful for diagnosing content differences or client-side rendering issues."
+    ),
+)
 
 emulate_googlebot = st.sidebar.checkbox(
-    "Emulate Googlebot",
+    "Run as Googlebot",
     value=False,
-    help="Use a Googlebot-like User-Agent for HTTP and Playwright.",
+    help=(
+        "Uses a Googlebot-like User-Agent to simulate Google’s own crawler. "
+        "Helpful for verifying how search engines see and index your pages."
+    ),
 )
 
 export_format = st.sidebar.selectbox("Export format", ["CSV", "JSON", "Parquet"])
@@ -83,9 +96,8 @@ def call_crawl_api(url_list):
         status = e.response.status_code if e.response is not None else None
         if status == 502:
             st.warning(
-                "The crawler API returned **502 Bad Gateway**.\n\n"
-                "This often means the Fly.io machine was sleeping or restarting. "
-                "Wait a few seconds and try running the crawl again."
+                "⚠️ **502!** This usually indicates that the machine was sleeping or restarting. "
+                "Please wait a few seconds and try running the crawl again."
             )
         else:
             st.error(f"API HTTP error ({status}): {e}")
@@ -157,8 +169,8 @@ with pages_tab:
         df = st.session_state["df"]
         st.dataframe(df, use_container_width=True)
         st.caption(
-            "🟡 **Diff score** ≈ how different the rendered HTML text is from the raw HTML text. "
-            "0 = identical, 1 = completely different."
+            "🟡 **Diff score** shows how much the rendered HTML differs from the raw HTML. "
+            "0% = identical, 100% = completely different."
         )
     else:
         st.info("Run a crawl to view results.")
@@ -193,7 +205,11 @@ with seo_tab:
             if not non_indexable.empty:
                 st.dataframe(
                     non_indexable[
-                        [c for c in ["url", "status", "meta_robots", "x_robots"] if c in non_indexable.columns]
+                        [
+                            c
+                            for c in ["url", "status", "meta_robots", "x_robots"]
+                            if c in non_indexable.columns
+                        ]
                     ],
                     use_container_width=True,
                 )
@@ -226,11 +242,17 @@ with sd_tab:
                 if not invalid.empty:
                     st.dataframe(invalid, use_container_width=True)
                 else:
-                    st.info("All detected structured data objects have required properties.")
+                    st.info(
+                        "All detected structured data objects have required properties."
+                    )
             else:
                 st.info("No validation info available.")
 
-            if not df_pages.empty and "url" in df_pages.columns and "url" in sddf.columns:
+            if (
+                not df_pages.empty
+                and "url" in df_pages.columns
+                and "url" in sddf.columns
+            ):
                 st.subheader("Pages with no structured data")
                 pages_with_sd = set(sddf["url"])
                 no_sd = df_pages[~df_pages["url"].isin(pages_with_sd)]
@@ -282,6 +304,11 @@ with cwv_tab:
         df = st.session_state["df"]
         if all(col in df.columns for col in ["lcp_ms", "cls", "inp_ms"]):
             st.subheader("Per-URL CWV metrics")
+            st.caption(
+                "ℹ️ CWV values are currently approximate and may be similar across pages "
+                "on the same domain. A future version will fetch true page-level field data "
+                "from the PageSpeed Insights / CrUX API."
+            )
             st.dataframe(
                 df[["url", "lcp_ms", "cls", "inp_ms"]],
                 use_container_width=True,
@@ -317,7 +344,9 @@ if "df" in st.session_state and not st.session_state["df"].empty:
         st.sidebar.download_button("⬇️ Download CSV", csv, "crawl_results.csv")
     elif export_format == "JSON":
         json_bytes = df.to_json(orient="records").encode("utf-8")
-        st.sidebar.download_button("⬇️ Download JSON", json_bytes, "crawl_results.json")
+        st.sidebar.download_button(
+            "⬇️ Download JSON", json_bytes, "crawl_results.json"
+        )
     elif export_format == "Parquet":
         buffer = BytesIO()
         df.to_parquet(buffer, index=False)

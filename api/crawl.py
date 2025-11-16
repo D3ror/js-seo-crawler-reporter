@@ -255,14 +255,19 @@ class CrawlerService:
 def compute_diff_score(raw_html: str, rendered_html: str) -> float:
     """
     Compute a simple text-based diff score between raw and rendered HTML.
-    Returns a value between 0 and 1 (fraction of difference).
+
+    Returns:
+        float: Percentage difference between 0 and 100.
+               0.0  = identical
+               100.0 = completely different
     """
     raw_text = " ".join(BeautifulSoup(raw_html, "lxml").get_text().split())
     ren_text = " ".join(BeautifulSoup(rendered_html, "lxml").get_text().split())
     if not raw_text and not ren_text:
         return 0.0
     ratio = SequenceMatcher(None, raw_text, ren_text).ratio()
-    return 1.0 - ratio
+    # convert fraction of difference to percentage
+    return round((1.0 - ratio) * 100.0, 2)
 
 
 def extract_jsonld(html: str):
