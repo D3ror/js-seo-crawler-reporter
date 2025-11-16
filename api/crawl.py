@@ -1,5 +1,5 @@
 # api/crawl.py
-import asyncio, json, base64, hashlib
+import asyncio, json, base64, hashlib, os
 from urllib.parse import (
     urlparse,
     urlunparse,
@@ -46,6 +46,11 @@ SCHEMA_REQUIRED: Dict[str, List[str]] = {
     "FAQPage": ["mainEntity"],
 }
 
+# -----------------------------------------
+# PSI API key (for Core Web Vitals)
+# -----------------------------------------
+PSI_API_KEY = os.getenv("PSI_API_KEY")
+
 
 # -----------------------------------------
 # Crawler service (browser reused across requests)
@@ -57,7 +62,7 @@ class CrawlerService:
         self._tasks: Dict[str, Dict[str, Any]] = {}
         self._browser = None
         self._worker_tasks: List[asyncio.Task] = []
-        self._client = httpx.AsyncClient(timeout=15)
+        self._client = httpx.AsyncClient(timeout=30)
 
     async def start(self):
         pw = await async_playwright().start()
@@ -106,8 +111,46 @@ class CrawlerService:
         return task
 
     async def get_cwv(self, url: str, strategy: str = "mobile") -> Dict[str, Any]:
-        """CWV hook called from _crawl_single or /cwv; stub for now."""
-        return await dummy_cwv(url)
+        """
+        Fetch Core Web Vitals using the PageSpeed Insights API.
+
+        If PSI_API_KEY is not set or the request fails, fall back to dummy_cwv.
+        """
+        if not PSI_API_KEY:
+            # No key configured – fall back to stub
+            return await dummy_cwv(url)
+
+        api = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
+        params = {
+            "url": url,
+            "category": "performance",
+            "strategy": strategy,  # "mobile" or "desktop"
+            "key": PSI_API_KEY,
+        }
+
+        try:
+            r = await self._client.get(api, params=params)
+            r.raise_for_status()
+            data = r.json()
+
+            # Try to pull CWV from loadingExperience metrics (field data)
+            metrics = data.get("loadingExperience", {}).get("metrics", {})
+
+            lcp = metrics.get("LARGEST_CONTENTFUL_PAINT_MS", {}).get("percentile")
+            cls = metrics.get("CUMULATIVE_LAYOUT_SHIFT_SCORE", {}).get("percentile")
+            inp = metrics.get("INTERACTION_TO_NEXT_PAINT", {}).get("percentile")
+
+            return {
+                "url": url,
+                "lcp_ms": lcp if lcp is not None else 2500,
+                "cls": cls if cls is not None else 0.1,
+                "inp_ms": inp if inp is not None else 150,
+            }
+
+        except Exception as e:
+            # Log and fall back to dummy CWV
+            print("PSI API error for URL", url, ":", repr(e))
+            return await dummy_cwv(url)
 
     # -----------------------------------------
     # HTTP + rendering
@@ -221,7 +264,7 @@ class CrawlerService:
         jsonld = extract_jsonld(rendered_html)
         schema_validations = validate_jsonld(jsonld)
 
-        # CWV stub
+        # CWV (now page-level via PSI where possible)
         psi = await self.get_cwv(norm)
 
         # Indexability heuristic
@@ -326,7 +369,7 @@ def is_indexable(status: int, meta_robots: Optional[str], x_robots: Optional[str
 async def dummy_cwv(url: str) -> Dict[str, Any]:
     """
     Temporary CWV stub.
-    Replace with a real PSI / CrUX integration later.
+    Used when PSI_API_KEY is not configured or PSI call fails.
     """
     return {
         "url": url,
