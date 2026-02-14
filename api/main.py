@@ -13,6 +13,11 @@ from api.crawl import (
 app = FastAPI(title="JS SEO Crawler API")
 crawler: Optional[CrawlerService] = None
 
+# Demo caps (server-side enforcement)
+MAX_URLS_LIST_MODE = 10
+MAX_PAGES_DOMAIN_MODE = 10
+MAX_DEPTH_DOMAIN_MODE = 3
+
 
 class CrawlRequest(BaseModel):
     """
@@ -71,28 +76,36 @@ async def crawl_url(request: CrawlRequest):
         raise HTTPException(status_code=400, detail="No URLs provided")
 
     # Hard safety caps for demo stability
-    urls = request.urls[:20]  # max 20 URLs even if client sends more
-    max_pages = max(1, min(request.max_pages, 50))
-    max_depth = max(1, min(request.max_depth, 3))
+    mode = (request.mode or "list").lower().strip()
+    urls = request.urls
+
+    if mode == "domain":
+        # Only the first URL is used as seed; cap pages/depth
+        urls = [urls[0]]
+        max_pages = max(1, min(request.max_pages, MAX_PAGES_DOMAIN_MODE))
+        max_depth = max(1, min(request.max_depth, MAX_DEPTH_DOMAIN_MODE))
+    else:
+        # List mode: cap to 10 URLs
+        mode = "list"
+        urls = urls[:MAX_URLS_LIST_MODE]
+        max_pages = None
+        max_depth = None
 
     options = {
         "emulate_googlebot": request.emulate_googlebot,
-        "mode": request.mode,
+        "mode": mode,
     }
 
     try:
-        if request.mode == "domain":
-            # Use first URL as seed
-            start_url = urls[0]
+        if mode == "domain":
             result = await crawl_domain_immediate(
                 crawler,
-                start_url=start_url,
+                start_url=urls[0],
                 max_pages=max_pages,
                 max_depth=max_depth,
                 options=options,
             )
         else:
-            # Default: treat urls as explicit list
             result = await crawl_urls_immediate(
                 crawler,
                 urls,
@@ -102,17 +115,12 @@ async def crawl_url(request: CrawlRequest):
         return result
 
     except Exception as e:
-        # Log to stdout so you can see it in `fly logs`
         print("Error in /crawl:", repr(e))
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/cwv")
 async def get_cwv(url: str, strategy: str = "mobile"):
-    """
-    CWV endpoint used by the Streamlit UI.
-    Currently calls CrawlerService.get_cwv (PSI + fallback).
-    """
     if not crawler:
         raise HTTPException(status_code=500, detail="Crawler not initialized")
     try:

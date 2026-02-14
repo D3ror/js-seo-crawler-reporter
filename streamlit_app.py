@@ -10,6 +10,10 @@ st.set_page_config(page_title="JS SEO Crawler", layout="wide")
 
 API_BASE_URL = st.secrets.get("API_BASE_URL", "http://127.0.0.1:8080")
 
+# Demo limits
+MAX_DEMO_URLS_LIST = 10
+MAX_DEMO_DOMAIN_PAGES = 10
+
 # ==========================================
 # SIDEBAR SETTINGS
 # ==========================================
@@ -33,9 +37,13 @@ urls = st.sidebar.text_area(
     ),
 )
 
-# Domain crawl limits (tightened for demo stability)
+# Domain crawl limits (restricted for demo stability)
 max_pages = st.sidebar.slider(
-    "Max pages (domain crawl)", min_value=5, max_value=50, value=20, step=5
+    "Max pages (domain crawl)",
+    min_value=1,
+    max_value=MAX_DEMO_DOMAIN_PAGES,
+    value=MAX_DEMO_DOMAIN_PAGES,
+    step=1,
 )
 max_depth = st.sidebar.slider(
     "Max depth (domain crawl)", min_value=1, max_value=3, value=2
@@ -148,13 +156,13 @@ if run_button:
             else:
                 st.error("Domain crawl failed or returned no data.")
         else:
-            # URL list mode: crawl each URL one by one with progress bar
-            if len(url_list) > 20:
+            # URL list mode: cap at 10 for demo stability
+            if len(url_list) > MAX_DEMO_URLS_LIST:
                 st.warning(
-                    "For demo purposes, a maximum of 20 URLs is allowed per crawl. "
-                    "Only the first 20 URLs will be used."
+                    f"For demo purposes, a maximum of {MAX_DEMO_URLS_LIST} URLs is allowed per crawl. "
+                    f"Only the first {MAX_DEMO_URLS_LIST} URLs will be used."
                 )
-                url_list = url_list[:20]
+                url_list = url_list[:MAX_DEMO_URLS_LIST]
 
             total = len(url_list)
             progress = st.progress(0)
@@ -200,7 +208,7 @@ if "crawl_results" in st.session_state and "df" not in st.session_state:
     )
 
 # ==========================================
-# MAIN TABS (no explicit Crawl tab anymore)
+# MAIN TABS
 # ==========================================
 tabs = st.tabs(
     [
@@ -229,9 +237,8 @@ with pages_tab:
     else:
         st.info("Run a crawl to view results.")
 
-
 # ==========================================
-# TAB: SEO DATA (indexability view)
+# TAB: SEO DATA
 # ==========================================
 with seo_tab:
     st.header("SEO Signals & Indexability")
@@ -284,7 +291,6 @@ with seo_tab:
     else:
         st.info("Run a crawl to display SEO data.")
 
-
 # ==========================================
 # TAB: STRUCTURED DATA
 # ==========================================
@@ -306,9 +312,7 @@ with sd_tab:
                 if not invalid.empty:
                     st.dataframe(invalid, use_container_width=True)
                 else:
-                    st.info(
-                        "All detected structured data objects have required properties."
-                    )
+                    st.info("All detected structured data objects have required properties.")
             else:
                 st.info("No validation info available.")
 
@@ -323,14 +327,11 @@ with sd_tab:
                 if not no_sd.empty:
                     st.dataframe(no_sd[["url"]], use_container_width=True)
                 else:
-                    st.info(
-                        "All crawled pages have at least one structured data object."
-                    )
+                    st.info("All crawled pages have at least one structured data object.")
         else:
             st.warning("No structured data detected on any crawled page.")
     else:
         st.info("Run a crawl first to analyze structured data.")
-
 
 # ==========================================
 # TAB: LINKS
@@ -359,7 +360,6 @@ with links_tab:
     else:
         st.info("Run a crawl to view link data.")
 
-
 # ==========================================
 # TAB: CORE WEB VITALS
 # ==========================================
@@ -374,29 +374,19 @@ with cwv_tab:
                 "ℹ️ CWV values are fetched from the PageSpeed Insights API on a per-URL basis. "
                 "In domain crawls, only the first few pages receive CWV data to keep the demo fast."
             )
-            st.dataframe(
-                df[["url", "lcp_ms", "cls", "inp_ms"]],
-                use_container_width=True,
-            )
+            st.dataframe(df[["url", "lcp_ms", "cls", "inp_ms"]], use_container_width=True)
 
             st.subheader("Worst LCP (slowest pages)")
             worst_lcp = df.sort_values("lcp_ms", ascending=False).head(10)
-            st.dataframe(
-                worst_lcp[["url", "lcp_ms"]],
-                use_container_width=True,
-            )
+            st.dataframe(worst_lcp[["url", "lcp_ms"]], use_container_width=True)
 
             st.subheader("Worst CLS (layout shifts)")
             worst_cls = df.sort_values("cls", ascending=False).head(10)
-            st.dataframe(
-                worst_cls[["url", "cls"]],
-                use_container_width=True,
-            )
+            st.dataframe(worst_cls[["url", "cls"]], use_container_width=True)
         else:
             st.info("CWV metrics are not present in the current crawl results.")
     else:
         st.info("Run a crawl first to see CWV metrics.")
-
 
 # ==========================================
 # EXPORT RESULTS
@@ -409,12 +399,8 @@ if "df" in st.session_state and not st.session_state["df"].empty:
         st.sidebar.download_button("⬇️ Download CSV", csv, "crawl_results.csv")
     elif export_format == "JSON":
         json_bytes = df.to_json(orient="records").encode("utf-8")
-        st.sidebar.download_button(
-            "⬇️ Download JSON", json_bytes, "crawl_results.json"
-        )
+        st.sidebar.download_button("⬇️ Download JSON", json_bytes, "crawl_results.json")
     elif export_format == "Parquet":
         buffer = BytesIO()
         df.to_parquet(buffer, index=False)
-        st.sidebar.download_button(
-            "⬇️ Download Parquet", buffer.getvalue(), "crawl_results.parquet"
-        )
+        st.sidebar.download_button("⬇️ Download Parquet", buffer.getvalue(), "crawl_results.parquet")
