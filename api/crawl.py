@@ -66,9 +66,7 @@ class CrawlerService:
 
     async def start(self):
         pw = await async_playwright().start()
-        # Headless chromium
         self._browser = await pw.chromium.launch(headless=True)
-        # Workers are only needed if you keep the job-queue API
         for _ in range(self.concurrency):
             t = asyncio.create_task(self._worker())
             self._worker_tasks.append(t)
@@ -113,18 +111,16 @@ class CrawlerService:
     async def get_cwv(self, url: str, strategy: str = "mobile") -> Dict[str, Any]:
         """
         Fetch Core Web Vitals using the PageSpeed Insights API.
-
-        If PSI_API_KEY is not set or the request fails, fall back to dummy_cwv.
+        If PSI_API_KEY is not set or PSI fails, fall back to dummy_cwv.
         """
         if not PSI_API_KEY:
-            # No key configured – fall back to stub
             return await dummy_cwv(url)
 
         api = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
         params = {
             "url": url,
             "category": "performance",
-            "strategy": strategy,  # "mobile" or "desktop"
+            "strategy": strategy,
             "key": PSI_API_KEY,
         }
 
@@ -133,7 +129,6 @@ class CrawlerService:
             r.raise_for_status()
             data = r.json()
 
-            # Try to pull CWV from loadingExperience metrics (field data)
             metrics = data.get("loadingExperience", {}).get("metrics", {})
 
             lcp = metrics.get("LARGEST_CONTENTFUL_PAINT_MS", {}).get("percentile")
@@ -148,7 +143,6 @@ class CrawlerService:
             }
 
         except Exception as e:
-            # Log and fall back to dummy CWV
             print("PSI API error for URL", url, ":", repr(e))
             return await dummy_cwv(url)
 
@@ -167,9 +161,18 @@ class CrawlerService:
         self,
         url: str,
         wait_until: str = "domcontentloaded",
-        timeout: int = 15000,
+        timeout: int = 30000,  # ↑ increase nav timeout
         user_agent: Optional[str] = None,
+        block_resources: bool = True,
+        full_page_screenshot: bool = False,
     ):
+        """
+        Render a page with Playwright and return (html, screenshot_bytes).
+
+        Performance features:
+        - optional resource blocking (images/fonts/media) to reduce timeouts
+        - optional full-page screenshot (off by default to speed up)
+        """
         ctx_kwargs: Dict[str, Any] = {
             "viewport": {"width": 1366, "height": 768},
         }
@@ -178,9 +181,27 @@ class CrawlerService:
 
         ctx = await self._browser.new_context(**ctx_kwargs)
         page = await ctx.new_page()
+
+        if block_resources:
+            async def route_handler(route):
+                try:
+                    rt = route.request.resource_type
+                    if rt in ("image", "media", "font"):
+                        await route.abort()
+                    else:
+                        await route.continue_()
+                except Exception:
+                    # If something goes wrong, don't block the crawl
+                    await route.continue_()
+
+            await page.route("**/*", route_handler)
+
         await page.goto(url, wait_until=wait_until, timeout=timeout)
         content = await page.content()
-        screenshot = await page.screenshot(full_page=True)
+
+        # Screenshot last (avoid wasting time if navigation fails)
+        screenshot = await page.screenshot(full_page=full_page_screenshot)
+
         await page.close()
         await ctx.close()
         return content, screenshot
@@ -199,20 +220,61 @@ class CrawlerService:
         parsed = urlparse(norm)
         base_host = parsed.hostname or ""
 
-        # Emulate Googlebot if requested
+        # options
+        emulate_googlebot = bool(options.get("emulate_googlebot"))
+        full_page_screenshot = bool(options.get("full_page_screenshot", False))
+        block_resources = bool(options.get("block_resources", True))
+
         ua = None
-        if options.get("emulate_googlebot"):
+        if emulate_googlebot:
             ua = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
 
         try:
-            # robots.txt checks are TODO; we just fetch page for now
             status, raw_html, headers = await self._fetch_raw(norm, user_agent=ua)
 
-            # Bound the render time per page
-            rendered_html, screenshot = await asyncio.wait_for(
-                self._render(norm, user_agent=ua),
-                timeout=20,
-            )
+            # ---- Render with retry strategy ----
+            render_ok = False
+            render_attempts = 0
+            render_error = None
+
+            rendered_html = ""
+            screenshot = b""
+
+            # attempt 1: domcontentloaded
+            # attempt 2 (if timeout): commit (faster fallback)
+            nav_strategies = [("domcontentloaded", 30000), ("commit", 30000)]
+
+            for wait_until, goto_timeout in nav_strategies:
+                render_attempts += 1
+                try:
+                    rendered_html, screenshot = await asyncio.wait_for(
+                        self._render(
+                            norm,
+                            wait_until=wait_until,
+                            timeout=goto_timeout,
+                            user_agent=ua,
+                            block_resources=block_resources,
+                            full_page_screenshot=full_page_screenshot,
+                        ),
+                        timeout=40,  # ↑ overall cap (must exceed goto timeout)
+                    )
+                    render_ok = True
+                    render_error = None
+                    break
+                except Exception as e:
+                    render_error = str(e)
+
+            if not render_ok:
+                # Give a meaningful timeout classification
+                return {
+                    "url": norm,
+                    "status": status,
+                    "error_type": "render_timeout",
+                    "error_message": render_error or "Render failed (unknown)",
+                    "render_ok": False,
+                    "render_attempts": render_attempts,
+                    "render_error": render_error,
+                }
 
             # --- Text diff between raw & rendered ---
             diff_score = compute_diff_score(raw_html, rendered_html)
@@ -220,35 +282,25 @@ class CrawlerService:
             # --- Parse rendered DOM ---
             soup = BeautifulSoup(rendered_html, "lxml")
 
-            # Title
-            title_tag = (
-                soup.title.string.strip()
-                if soup.title and soup.title.string
-                else None
-            )
+            title_tag = soup.title.string.strip() if soup.title and soup.title.string else None
 
-            # Meta description
             meta_desc = None
             md = soup.find("meta", attrs={"name": "description"})
             if md and md.get("content"):
                 meta_desc = md["content"].strip()
 
-            # Canonical
             canonical_tag = None
             canon = soup.find("link", rel=lambda v: v and "canonical" in v.lower())
             if canon and canon.get("href"):
                 canonical_tag = canon["href"].strip()
 
-            # Meta robots
             meta_robots = None
             mr = soup.find("meta", attrs={"name": "robots"})
             if mr and mr.get("content"):
                 meta_robots = mr["content"].strip().lower()
 
-            # X-Robots-Tag (from headers)
             x_robots = headers.get("x-robots-tag") or headers.get("X-Robots-Tag")
 
-            # Hreflang
             hreflangs: List[Dict[str, str]] = []
             for link in soup.find_all("link", rel=lambda v: v and "alternate" in v.lower()):
                 lang = link.get("hreflang")
@@ -256,7 +308,6 @@ class CrawlerService:
                 if lang and href:
                     hreflangs.append({"lang": lang, "href": href})
 
-            # Links
             internal_links: Set[str] = set()
             external_links: Set[str] = set()
             for a in soup.find_all("a", href=True):
@@ -270,14 +321,11 @@ class CrawlerService:
                 else:
                     external_links.add(normalize_url(abs_url))
 
-            # Structured data
             jsonld = extract_jsonld(rendered_html)
             schema_validations = validate_jsonld(jsonld)
 
-            # Indexability heuristic
             indexable_flag = is_indexable(status, meta_robots, x_robots)
 
-            # build detailed single-page result (without PSI, added later)
             return {
                 "url": norm,
                 "status": status,
@@ -295,6 +343,9 @@ class CrawlerService:
                 "internal_links": list(internal_links),
                 "external_links": list(external_links),
                 "indexable": indexable_flag,
+                "render_ok": True,
+                "render_attempts": render_attempts,
+                "render_error": None,
             }
 
         except httpx.TimeoutException as e:
@@ -311,13 +362,6 @@ class CrawlerService:
                 "error_type": "http_error",
                 "error_message": str(e),
             }
-        except asyncio.TimeoutError as e:
-            return {
-                "url": norm,
-                "status": 0,
-                "error_type": "render_timeout",
-                "error_message": str(e),
-            }
         except Exception as e:
             return {
                 "url": norm,
@@ -331,25 +375,15 @@ class CrawlerService:
 # Helper functions for diffs & structured data
 # -----------------------------------------
 def compute_diff_score(raw_html: str, rendered_html: str) -> float:
-    """
-    Compute a simple text-based diff score between raw and rendered HTML.
-
-    Returns:
-        float: Percentage difference between 0 and 100.
-               0.0  = identical
-               100.0 = completely different
-    """
     raw_text = " ".join(BeautifulSoup(raw_html, "lxml").get_text().split())
     ren_text = " ".join(BeautifulSoup(rendered_html, "lxml").get_text().split())
     if not raw_text and not ren_text:
         return 0.0
     ratio = SequenceMatcher(None, raw_text, ren_text).ratio()
-    # convert fraction of difference to percentage
     return round((1.0 - ratio) * 100.0, 2)
 
 
 def extract_jsonld(html: str):
-    """Extract JSON-LD blocks from the rendered HTML."""
     soup = BeautifulSoup(html, "lxml")
     blocks = []
     for tag in soup.find_all("script", {"type": "application/ld+json"}):
@@ -362,16 +396,11 @@ def extract_jsonld(html: str):
             else:
                 blocks.append(data)
         except Exception:
-            # ignore malformed JSON-LD
             continue
     return blocks
 
 
 def validate_jsonld(jsonld_blocks):
-    """
-    Minimal validation:
-    - Check a few required properties for common schema.org types.
-    """
     results = []
     for obj in jsonld_blocks:
         t = obj.get("@type", "Unknown")
@@ -388,11 +417,6 @@ def validate_jsonld(jsonld_blocks):
 
 
 def is_indexable(status: int, meta_robots: Optional[str], x_robots: Optional[str]) -> bool:
-    """
-    Very rough indexability heuristic:
-    - Non-4xx/5xx
-    - No 'noindex' in meta robots or X-Robots-Tag
-    """
     if status >= 400:
         return False
     txt = " ".join(filter(None, [meta_robots or "", x_robots or ""])).lower()
@@ -402,10 +426,6 @@ def is_indexable(status: int, meta_robots: Optional[str], x_robots: Optional[str
 
 
 async def dummy_cwv(url: str) -> Dict[str, Any]:
-    """
-    Temporary CWV stub.
-    Used when PSI_API_KEY is not configured or PSI call fails.
-    """
     return {
         "url": url,
         "lcp_ms": 2500,
@@ -422,15 +442,6 @@ async def crawl_urls_immediate(
     urls: List[str],
     options: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """
-    Crawl a list of URLs *immediately* (no job queue),
-    and return results in the shape expected by the Streamlit UI:
-    {
-      "pages": [...],
-      "structured_data": [...],
-      "links": {"internal": [...], "external": [...]}
-    }
-    """
     if options is None:
         options = {}
 
@@ -445,7 +456,6 @@ async def crawl_urls_immediate(
         error_type = single.get("error_type")
         psi: Dict[str, Any] = {}
 
-        # Only call PSI if the page crawl itself didn't fail
         if not error_type and single.get("url"):
             psi = await service.get_cwv(single["url"])
 
@@ -457,23 +467,21 @@ async def crawl_urls_immediate(
                 "meta_description": single.get("meta_description"),
                 "canonical": single.get("canonical"),
                 "robots": single.get("meta_robots") or single.get("x_robots"),
-                "hreflang": ", ".join(
-                    [h["lang"] for h in single.get("hreflangs", [])]
-                )
-                or None,
+                "hreflang": ", ".join([h["lang"] for h in single.get("hreflangs", [])]) or None,
                 "diff_score": single.get("diff_score"),
                 "indexable": single.get("indexable"),
                 "error_type": error_type,
                 "error_message": single.get("error_message"),
+                "render_ok": single.get("render_ok"),
+                "render_attempts": single.get("render_attempts"),
+                "render_error": single.get("render_error"),
                 "lcp_ms": psi.get("lcp_ms"),
                 "cls": psi.get("cls"),
                 "inp_ms": psi.get("inp_ms"),
             }
         )
 
-        for block, validation in zip(
-            single.get("jsonld", []), single.get("schema_validations", [])
-        ):
+        for block, validation in zip(single.get("jsonld", []), single.get("schema_validations", [])):
             structured_data.append(
                 {
                     "url": single.get("url", u),
@@ -489,10 +497,7 @@ async def crawl_urls_immediate(
     return {
         "pages": pages,
         "structured_data": structured_data,
-        "links": {
-            "internal": sorted(all_internal_links),
-            "external": sorted(all_external_links),
-        },
+        "links": {"internal": sorted(all_internal_links), "external": sorted(all_external_links)},
     }
 
 
@@ -506,14 +511,6 @@ async def crawl_domain_immediate(
     max_depth: int = 2,
     options: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """
-    Crawl a domain starting from start_url, following internal links
-    up to max_pages and max_depth (BFS), and return the same structure
-    as crawl_urls_immediate.
-
-    To keep the demo fast and within PSI limits, CWV is only fetched
-    for the first few pages.
-    """
     if options is None:
         options = {}
 
@@ -530,7 +527,6 @@ async def crawl_domain_immediate(
     all_internal_links: Set[str] = set()
     all_external_links: Set[str] = set()
 
-    # Only fetch CWV for first N pages in domain mode
     MAX_PSI_PAGES = 5
 
     while not queue.empty() and len(visited) < max_pages:
@@ -539,11 +535,7 @@ async def crawl_domain_immediate(
             continue
         visited.add(current_url)
 
-        try:
-            single = await service._crawl_single(current_url, options)
-        except Exception:
-            # If _crawl_single itself exploded, skip this URL entirely
-            continue
+        single = await service._crawl_single(current_url, options)
 
         error_type = single.get("error_type")
         psi: Dict[str, Any] = {}
@@ -559,23 +551,21 @@ async def crawl_domain_immediate(
                 "meta_description": single.get("meta_description"),
                 "canonical": single.get("canonical"),
                 "robots": single.get("meta_robots") or single.get("x_robots"),
-                "hreflang": ", ".join(
-                    [h["lang"] for h in single.get("hreflangs", [])]
-                )
-                or None,
+                "hreflang": ", ".join([h["lang"] for h in single.get("hreflangs", [])]) or None,
                 "diff_score": single.get("diff_score"),
                 "indexable": single.get("indexable"),
                 "error_type": error_type,
                 "error_message": single.get("error_message"),
+                "render_ok": single.get("render_ok"),
+                "render_attempts": single.get("render_attempts"),
+                "render_error": single.get("render_error"),
                 "lcp_ms": psi.get("lcp_ms"),
                 "cls": psi.get("cls"),
                 "inp_ms": psi.get("inp_ms"),
             }
         )
 
-        for block, validation in zip(
-            single.get("jsonld", []), single.get("schema_validations", [])
-        ):
+        for block, validation in zip(single.get("jsonld", []), single.get("schema_validations", [])):
             structured_data.append(
                 {
                     "url": single.get("url", current_url),
@@ -590,7 +580,6 @@ async def crawl_domain_immediate(
         all_internal_links.update(internal_links)
         all_external_links.update(external_links)
 
-        # enqueue internal links for BFS
         if depth + 1 <= max_depth:
             for link in internal_links:
                 parsed_link = urlparse(link)
@@ -600,8 +589,5 @@ async def crawl_domain_immediate(
     return {
         "pages": pages,
         "structured_data": structured_data,
-        "links": {
-            "internal": sorted(all_internal_links),
-            "external": sorted(all_external_links),
-        },
+        "links": {"internal": sorted(all_internal_links), "external": sorted(all_external_links)},
     }
